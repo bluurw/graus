@@ -77,6 +77,7 @@ type Options struct {
 	MaxBytes    int // -1 = ilimitado
 	Incomplete  bool
 	EntryPoints bool
+	JSLoose     bool // extração agressiva de strings JS (camada 3)
 }
 
 // Fetch baixa uma URL e extrai links.
@@ -163,7 +164,20 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 		}
 
 		ct := resp.Header.Get("Content-Type")
-		links := extractLinks(body, ct, fixedURL, opt.Incomplete || opt.EntryPoints)
+		lowerCT := strings.ToLower(ct)
+
+		var links []string
+		switch {
+		case strings.Contains(lowerCT, "text/html") || lowerCT == "":
+			links = extractLinks(body, ct, fixedURL, opt.Incomplete || opt.EntryPoints, opt.JSLoose)
+
+		case strings.Contains(lowerCT, "javascript") || strings.Contains(lowerCT, "ecmascript"):
+			links = ExtractJSLinks(body, mustParse(fixedURL), opt.Incomplete || opt.EntryPoints, opt.JSLoose)
+
+		case strings.Contains(lowerCT, "text/css"):
+			links = ExtractCSSLinks(body, mustParse(fixedURL), opt.Incomplete || opt.EntryPoints)
+		}
+
 		return Result{
 			Links:  links,
 			Status: resp.StatusCode,
@@ -186,8 +200,14 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// mustParse só é usada para URLs que já sabemos válidas.
+func mustParse(raw string) *url.URL {
+	u, _ := url.Parse(raw)
+	return u
+}
+
 // extractLinks extrai links de HTML + regex de texto bruto.
-func extractLinks(body []byte, contentType, fixedURL string, incomplete bool) []string {
+func extractLinks(body []byte, contentType, fixedURL string, incomplete, jsLoose bool) []string {
 	linkSet := make(map[string]struct{}, 200)
 	baseURL, _ := url.Parse(fixedURL)
 
@@ -196,7 +216,7 @@ func extractLinks(body []byte, contentType, fixedURL string, incomplete bool) []
 		r, err := charset.NewReader(bytes.NewReader(body), contentType)
 		if err == nil {
 			if doc, err := html.Parse(r); err == nil {
-				extractFromDOM(doc, baseURL, linkSet, incomplete)
+				extractFromDOM(doc, baseURL, linkSet, incomplete, jsLoose)
 			}
 		}
 	}
@@ -218,7 +238,7 @@ func extractLinks(body []byte, contentType, fixedURL string, incomplete bool) []
 }
 
 // extractFromDOM percorre a árvore HTML e resolve links relativos.
-func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, incomplete bool) {
+func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, incomplete, jsLoose bool) {
 	// Descobre <base href>
 	base := baseURL
 	var findBase func(*html.Node)
@@ -241,6 +261,25 @@ func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, i
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode {
+			// <script> inline (sem src) — extrai endpoints de JS embutido
+			if n.Data == "script" {
+				hasSrc := false
+				for _, a := range n.Attr {
+					if a.Key == "src" && a.Val != "" {
+						hasSrc = true
+						break
+					}
+				}
+				if !hasSrc && n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+					inline := n.FirstChild.Data
+					if len(inline) > 0 {
+						for _, l := range ExtractJSLinks([]byte(inline), base, incomplete, jsLoose) {
+							out[l] = struct{}{}
+						}
+					}
+				}
+			}
+
 			if attrs, ok := urlAttrs[n.Data]; ok {
 				for _, attr := range attrs {
 					for _, a := range n.Attr {

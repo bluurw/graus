@@ -40,6 +40,7 @@ func main() {
 		urlRetry, domainDepth, urlMinBytes, urlMaxBytes      int
 		maxURLs, globalTimeout, workers, maxNodes            int
 		clusterThreshold                                     int
+		jsLoose                                              bool
 	)
 
 	flag.StringVar(&target, "t", "", "Target URL")
@@ -68,6 +69,7 @@ func main() {
 	flag.BoolVar(&graphJS, "graph-js", false, "Generate .js file with URL map")
 	flag.IntVar(&maxNodes, "max-nodes", 10000, "Maximum number of nodes in graph")
 	flag.IntVar(&clusterThreshold, "cluster-threshold", 50, "Minimum nodes per cluster")
+	flag.BoolVar(&jsLoose, "js-loose", false, "Enable aggressive JS string extraction (more results, more noise)")
 	flag.Parse()
 
 	if noTimeout {
@@ -197,6 +199,7 @@ func main() {
 		MaxBytes:    urlMaxBytes,
 		Incomplete:  urlIncomplete,
 		EntryPoints: urlEntrypoints,
+		JSLoose:     jsLoose,
 	}
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
