@@ -6,19 +6,21 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 
+	"grau/internal/ratelimit"
 	"grau/internal/urlutil"
 )
 
-// MaxBodySize é o tamanho máximo do corpo baixado.
 const MaxBodySize = 20 * 1024 * 1024
 
 var userAgents = []string{
@@ -45,20 +47,41 @@ var urlAttrs = map[string][]string{
 	"track":  {"src"},
 }
 
-// Client é o HTTP client compartilhado (não segue redirects automaticamente).
-var Client = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:        500,
-		MaxIdleConnsPerHost: 150,
-		IdleConnTimeout:     60 * time.Second,
-		TLSHandshakeTimeout: 5 * time.Second,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   true,
-	},
-	Timeout: 30 * time.Second,
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
+// Client global — construído por BuildClient.
+var Client *http.Client
+
+// BuildClient cria o HTTP client com base nas Options do crawler.
+// Deve ser chamado uma vez em main().
+func BuildClient(proxyURL string) error {
+	tr := &http.Transport{
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   150,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second, // NOVO
+		ExpectContinueTimeout: 1 * time.Second,
+		// Compressão LIGADA (padrão do Go) — economiza banda
+		ForceAttemptHTTP2: true,
+	}
+
+	if proxyURL != "" {
+		pu, err := url.Parse(proxyURL)
+		if err != nil {
+			return fmt.Errorf("invalid proxy URL: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	} else {
+		tr.Proxy = http.ProxyFromEnvironment
+	}
+
+	Client = &http.Client{
+		Transport: tr,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return nil
 }
 
 // Result é o resultado de um crawl de uma URL.
@@ -70,14 +93,18 @@ type Result struct {
 	Err    error
 }
 
-// Options controla o comportamento do crawl de uma URL.
+// Options controla o comportamento do crawl.
 type Options struct {
 	Retries     int
 	MinBytes    int
-	MaxBytes    int // -1 = ilimitado
+	MaxBytes    int
 	Incomplete  bool
 	EntryPoints bool
-	JSLoose     bool // extração agressiva de strings JS (camada 3)
+	JSLoose     bool
+
+	// NOVOS
+	Limiter *ratelimit.HostLimiter
+	Headers map[string]string
 }
 
 // Fetch baixa uma URL e extrai links.
@@ -89,10 +116,23 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 		fixedURL = "https://" + fixedURL
 	}
 
+	parsed, _ := url.Parse(fixedURL)
+	host := ""
+	if parsed != nil {
+		host = parsed.Host
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < opt.Retries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return Result{Err: err}
+		}
+
+		// Rate limit por host
+		if opt.Limiter != nil && host != "" {
+			if err := opt.Limiter.Wait(ctx, host); err != nil {
+				return Result{Err: err}
+			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fixedURL, nil)
@@ -102,12 +142,16 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 		req.Header.Set("User-Agent", userAgents[attempt%len(userAgents)])
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Cache-Control", "no-cache")
+		for k, v := range opt.Headers {
+			req.Header.Set(k, v)
+		}
 
 		resp, err := Client.Do(req)
 		if err != nil {
 			lastErr = err
 			if attempt < opt.Retries-1 {
-				if !sleepCtx(ctx, time.Duration(attempt+1)*200*time.Millisecond) {
+				if !sleepCtx(ctx, backoff(attempt)) {
 					return Result{Err: ctx.Err()}
 				}
 				continue
@@ -120,7 +164,7 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 		if readErr != nil {
 			lastErr = readErr
 			if attempt < opt.Retries-1 {
-				if !sleepCtx(ctx, time.Duration(attempt+1)*200*time.Millisecond) {
+				if !sleepCtx(ctx, backoff(attempt)) {
 					return Result{Err: ctx.Err()}
 				}
 				continue
@@ -128,8 +172,17 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 			return Result{Status: resp.StatusCode, RT: time.Since(start).Milliseconds(), Err: lastErr}
 		}
 
+		// Retry-After respeitado (429 / 503)
+		if resp.StatusCode == 429 || resp.StatusCode == 503 {
+			wait := parseRetryAfter(resp.Header.Get("Retry-After"))
+			if wait > 0 && wait <= 60*time.Second {
+				if !sleepCtx(ctx, wait) {
+					return Result{Err: ctx.Err()}
+				}
+			}
+		}
+
 		if resp.StatusCode != http.StatusOK {
-			// Redirects: devolve a Location normalizada
 			if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 				if loc := resp.Header.Get("Location"); loc != "" {
 					if n := urlutil.Normalize(loc, opt.Incomplete || opt.EntryPoints); n != "" {
@@ -143,7 +196,7 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 			}
 			lastErr = fmt.Errorf("status %d", resp.StatusCode)
 			if attempt < opt.Retries-1 {
-				if !sleepCtx(ctx, time.Duration(attempt+1)*200*time.Millisecond) {
+				if !sleepCtx(ctx, backoff(attempt)) {
 					return Result{Err: ctx.Err()}
 				}
 				continue
@@ -170,10 +223,8 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 		switch {
 		case strings.Contains(lowerCT, "text/html") || lowerCT == "":
 			links = extractLinks(body, ct, fixedURL, opt.Incomplete || opt.EntryPoints, opt.JSLoose)
-
 		case strings.Contains(lowerCT, "javascript") || strings.Contains(lowerCT, "ecmascript"):
 			links = ExtractJSLinks(body, mustParse(fixedURL), opt.Incomplete || opt.EntryPoints, opt.JSLoose)
-
 		case strings.Contains(lowerCT, "text/css"):
 			links = ExtractCSSLinks(body, mustParse(fixedURL), opt.Incomplete || opt.EntryPoints)
 		}
@@ -188,7 +239,35 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 	return Result{Err: fmt.Errorf("failed after retries: %w", lastErr)}
 }
 
-// sleepCtx dorme ou retorna false se o ctx for cancelado.
+// backoff exponencial com jitter: 200ms * 2^attempt + jitter(0-100ms).
+func backoff(attempt int) time.Duration {
+	base := 200 * time.Millisecond
+	mult := time.Duration(1) << uint(attempt)
+	if mult > 16 {
+		mult = 16
+	}
+	jitter := time.Duration(rand.Intn(100)) * time.Millisecond
+	return base*mult + jitter
+}
+
+// parseRetryAfter interpreta Retry-After em segundos ou data HTTP.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -200,18 +279,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// mustParse só é usada para URLs que já sabemos válidas.
 func mustParse(raw string) *url.URL {
 	u, _ := url.Parse(raw)
 	return u
 }
 
-// extractLinks extrai links de HTML + regex de texto bruto.
+// extractLinks — HTML + regex bruta.
 func extractLinks(body []byte, contentType, fixedURL string, incomplete, jsLoose bool) []string {
 	linkSet := make(map[string]struct{}, 200)
 	baseURL, _ := url.Parse(fixedURL)
 
-	// HTML parsing (usa charset detection)
 	if strings.Contains(strings.ToLower(contentType), "text/html") || contentType == "" {
 		r, err := charset.NewReader(bytes.NewReader(body), contentType)
 		if err == nil {
@@ -221,7 +298,6 @@ func extractLinks(body []byte, contentType, fixedURL string, incomplete, jsLoose
 		}
 	}
 
-	// Fallback/reforço: regex sobre o texto bruto
 	s := string(body)
 	for _, m := range urlutil.URLRegex().FindAllString(s, -1) {
 		if n := urlutil.Normalize(m, incomplete); n != "" {
@@ -237,9 +313,7 @@ func extractLinks(body []byte, contentType, fixedURL string, incomplete, jsLoose
 	return links
 }
 
-// extractFromDOM percorre a árvore HTML e resolve links relativos.
 func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, incomplete, jsLoose bool) {
-	// Descobre <base href>
 	base := baseURL
 	var findBase func(*html.Node)
 	findBase = func(n *html.Node) {
@@ -261,7 +335,6 @@ func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, i
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode {
-			// <script> inline (sem src) — extrai endpoints de JS embutido
 			if n.Data == "script" {
 				hasSrc := false
 				for _, a := range n.Attr {
@@ -293,8 +366,6 @@ func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, i
 							strings.HasPrefix(raw, "#") {
 							continue
 						}
-
-						// srcset tem formato "url 1x, url 2x"
 						if attr == "srcset" {
 							for _, part := range strings.Split(raw, ",") {
 								fields := strings.Fields(strings.TrimSpace(part))
@@ -304,7 +375,6 @@ func extractFromDOM(doc *html.Node, baseURL *url.URL, out map[string]struct{}, i
 							}
 							continue
 						}
-
 						collectOne(raw, base, out, incomplete)
 					}
 				}
@@ -341,7 +411,6 @@ func collectOne(raw string, base *url.URL, out map[string]struct{}, incomplete b
 	}
 }
 
-// ContentTypeLabel classifica o Content-Type em rótulo curto.
 func ContentTypeLabel(ct string) string {
 	ct = strings.ToLower(ct)
 	switch {
@@ -358,4 +427,9 @@ func ContentTypeLabel(ct string) string {
 	default:
 		return "OTHER"
 	}
+}
+
+// WellKnown busca robots.txt + sitemap.xml de um host e devolve URLs.
+func WellKnown(ctx context.Context, host string, incomplete, jsLoose bool) []string {
+	return FetchWellKnown(ctx, host, incomplete, jsLoose)
 }

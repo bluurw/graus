@@ -1,4 +1,3 @@
-// grau.go / main.go
 package main
 
 import (
@@ -21,12 +20,13 @@ import (
 	"grau/internal/crawler"
 	"grau/internal/graph"
 	"grau/internal/output"
+	"grau/internal/ratelimit"
 	"grau/internal/terminal"
 	"grau/internal/urlutil"
 )
 
 const (
-	Version    = "v10"
+	Version    = "v11"
 	MaxWorkers = 40
 )
 
@@ -34,13 +34,16 @@ func main() {
 	var (
 		target, list, outputFile                             string
 		urlExtensionsExclude, urlQueryStrings, urlExtensions string
-		urlFilter                                            string
+		urlFilter, proxyURL                                  string
+		headerFlags                                          multiFlag
 		urlEntrypoints, urlJsOnly, urlRepeat, urlIncomplete  bool
 		urlAll, noTimeout, graphHTML, graphStatic, graphJS   bool
 		urlRetry, domainDepth, urlMinBytes, urlMaxBytes      int
 		maxURLs, globalTimeout, workers, maxNodes            int
-		clusterThreshold                                     int
-		jsLoose                                              bool
+		clusterThreshold, hubsize                            int
+		jsLoose, quiet, jsonOut, robots, showVersion, yolo   bool
+		rateLimit                                            float64
+		rateBurst                                            int
 	)
 
 	flag.StringVar(&target, "t", "", "Target URL")
@@ -64,13 +67,50 @@ func main() {
 	flag.BoolVar(&noTimeout, "no-timeout", false, "Disable global timeout")
 	flag.IntVar(&workers, "workers", MaxWorkers, "Concurrent workers")
 	flag.BoolVar(&terminal.ColorEnabled, "color", false, "Enable color output")
+	flag.BoolVar(&verbose, "v", false, "Verbose mode (status per URL)")
 	flag.BoolVar(&graphHTML, "graph-html", false, "Generate HTML graph visualization")
 	flag.BoolVar(&graphStatic, "graph-static", false, "Generate static PNG graph (requires graphviz)")
 	flag.BoolVar(&graphJS, "graph-js", false, "Generate .js file with URL map")
 	flag.IntVar(&maxNodes, "max-nodes", 10000, "Maximum number of nodes in graph")
-	flag.IntVar(&clusterThreshold, "cluster-threshold", 50, "Minimum nodes per cluster")
-	flag.BoolVar(&jsLoose, "js-loose", false, "Enable aggressive JS string extraction (more results, more noise)")
+	flag.IntVar(&clusterThreshold, "cluster-threshold", 50, "Min nodes to auto-cluster")
+	flag.IntVar(&hubsize, "hubsize", 5, "clusterByHubsize threshold")
+	flag.BoolVar(&jsLoose, "js-loose", false, "Aggressive JS string extraction")
+
+	// NOVAS
+	flag.BoolVar(&quiet, "q", false, "Quiet: suppress stdout URLs (only file output)")
+	flag.BoolVar(&jsonOut, "json", false, "Output one JSON object per line")
+	flag.BoolVar(&robots, "robots", true, "Fetch robots.txt and sitemap.xml")
+	flag.StringVar(&proxyURL, "proxy", "", "HTTP/SOCKS proxy URL")
+	flag.Float64Var(&rateLimit, "rate-limit", 5, "Max requests per second per host (0 = unlimited)")
+	flag.IntVar(&rateBurst, "rate-burst", 10, "Burst for rate limiter")
+	flag.Var(&headerFlags, "H", "Custom header (e.g. -H 'Authorization: Bearer x')")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.BoolVar(&yolo, "yolo", false, "Aggressive mode: enables -url-all -js-loose -no-timeout -robots -rate-limit 0")
+
 	flag.Parse()
+
+	if yolo {
+		// Aviso interativo: exige confirmação explícita
+		fmt.Fprintf(os.Stderr, "%s[!] Modo YOLO ativado:%s\n", terminal.Yellow, terminal.Reset)
+		fmt.Fprintf(os.Stderr, "    - Sem rate limit, sem timeout, workers no máximo\n")
+		fmt.Fprintf(os.Stderr, "    - Só use em alvo que você tem autorização escrita\n")
+		if !confirmYolo() {
+			fmt.Fprintln(os.Stderr, "Cancelado.")
+			os.Exit(1)
+		}
+
+		urlAll = true
+		jsLoose = true
+		noTimeout = true
+		robots = true
+		rateLimit = 0
+		workers = MaxWorkers
+	}
+
+	if showVersion {
+		fmt.Println("grau", Version)
+		os.Exit(0)
+	}
 
 	if noTimeout {
 		globalTimeout = 0
@@ -79,22 +119,29 @@ func main() {
 	if target == "" && list == "" {
 		terminal.Art()
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\n\n\n\n%s Examples:%s\n", terminal.Bold, terminal.Reset)
+		fmt.Fprintf(os.Stderr, "\n\n%s Examples:%s\n", terminal.Bold, terminal.Reset)
 		fmt.Println(" Normal Crawler: go run . -t https://example.com")
-		fmt.Println(" Entrypoints:    go run . -t https://example.com -url-entrypoints -o entrypoints.txt")
+		fmt.Println(" Entrypoints:    go run . -t https://example.com -url-entrypoints")
 		fmt.Println(" JsOnly:         go run . -t https://example.com -url-jsOnly")
 		fmt.Println(" Incomplete:     go run . -t https://example.com -url-incomplete")
-		fmt.Println(" Fatal Scan:     go run . -l subdomains.txt -url-all -o endpoints.txt -workers 30 -no-timeout")
+		fmt.Println(" JS Loose:       go run . -t https://example.com -js-loose")
+		fmt.Println(" JSON output:    go run . -t https://example.com -json")
 		fmt.Println(" Graph HTML:     go run . -l urls.txt -graph-html nome")
-		fmt.Println(" Static Graph:   go run . -l urls.txt -graph-static nome")
-		fmt.Println(" JS Map:         go run . -l urls.txt -graph-js nome")
 		os.Exit(1)
 	}
 
-	// --- Coleta de start URLs e domínios permitidos ---
+	// Construir client (proxy)
+	if err := crawler.BuildClient(proxyURL); err != nil {
+		fmt.Fprintf(os.Stderr, "%sErro: %v%s\n", terminal.Red, err, terminal.Reset)
+		os.Exit(1)
+	}
+
+	// Headers customizados
+	customHeaders := parseHeaders(headerFlags)
+
+	// Coleta start URLs
 	startURLs := []string{}
 	allowedRoots := make(map[string]struct{}, 100)
-
 	if list != "" {
 		f, err := os.Open(list)
 		if err != nil {
@@ -128,7 +175,6 @@ func main() {
 		}
 	}
 
-	// --- Filtros ---
 	filters := urlutil.Filters{
 		EntryPoints: urlEntrypoints,
 		JSOnly:      urlJsOnly,
@@ -140,12 +186,15 @@ func main() {
 		FilterStr:   strings.ToLower(urlFilter),
 	}
 
-	// --- Estado ---
 	seen := make(map[string]struct{}, 500_000)
 	discovered := make(map[string]struct{}, 500_000)
 	printed := make(map[string]struct{}, 500_000)
 	domainDepths := make(map[string]int, 1000)
+
+	// NOVO: dedup de collectedURLs
+	collectedSet := make(map[string]struct{}, 500_000)
 	collectedURLs := make([]string, 0, 500_000)
+	metaByURL := make(map[string]graph.NodeMeta, 500_000)
 
 	for _, u := range startURLs {
 		if n := urlutil.Normalize(u, false); n != "" {
@@ -153,15 +202,15 @@ func main() {
 		}
 	}
 
-	// --- Saída persistente ---
 	out, err := output.New(outputFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sErro ao abrir arquivo de saída: %v%s\n", terminal.Red, err, terminal.Reset)
+		fmt.Fprintf(os.Stderr, "%sErro ao abrir arquivo: %v%s\n", terminal.Red, err, terminal.Reset)
 		os.Exit(1)
 	}
+	out.Quiet = quiet
+	out.JSON = jsonOut
 	defer out.Close()
 
-	// --- Contexto + sinal ---
 	var baseCtx context.Context
 	var cancel context.CancelFunc
 	if globalTimeout > 0 {
@@ -174,7 +223,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(baseCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// --- Progress bar ---
 	bar := progressbar.NewOptions(-1,
 		progressbar.OptionSetDescription("Crawling"),
 		progressbar.OptionSetWriter(os.Stderr),
@@ -182,6 +230,7 @@ func main() {
 		progressbar.OptionThrottle(100*time.Millisecond),
 		progressbar.OptionShowCount(),
 		progressbar.OptionShowIts(),
+		progressbar.OptionShowBytes(false),
 		progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }),
 		progressbar.OptionSetTheme(progressbar.Theme{
 			Saucer: "█", SaucerHead: ">", SaucerPadding: " ",
@@ -189,7 +238,8 @@ func main() {
 		}),
 	)
 
-	// --- Workers ---
+	limiter := ratelimit.New(rateLimit, rateBurst)
+
 	tasks := make(chan string, workers*2)
 	results := make(chan crawler.Result, workers)
 	var wg sync.WaitGroup
@@ -200,7 +250,10 @@ func main() {
 		Incomplete:  urlIncomplete,
 		EntryPoints: urlEntrypoints,
 		JSLoose:     jsLoose,
+		Limiter:     limiter,
+		Headers:     customHeaders,
 	}
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -219,13 +272,11 @@ func main() {
 		}()
 	}
 
-	// Fecha `results` quando todos os workers saírem
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// --- Loop principal (produtor) ---
 	var successCount, errorCount, linkCount int
 	var lastURL string
 	startTime := time.Now()
@@ -235,6 +286,24 @@ func main() {
 		queue := make([]string, 0, len(seen))
 		for k := range seen {
 			queue = append(queue, k)
+		}
+
+		// NOVO: robots/sitemap na primeira passada
+		if robots {
+			for host := range allowedRoots {
+				// best effort: tenta https
+				wk := crawler.WellKnown(ctx, host, urlIncomplete, jsLoose)
+				for _, u := range wk {
+					if _, ok := seen[u]; !ok {
+						seen[u] = struct{}{}
+						queue = append(queue, u)
+						if _, dup := collectedSet[u]; !dup {
+							collectedSet[u] = struct{}{}
+							collectedURLs = append(collectedURLs, u)
+						}
+					}
+				}
+			}
 		}
 
 		for len(queue) > 0 && ctx.Err() == nil {
@@ -277,7 +346,15 @@ func main() {
 			}
 			bar.Add(1)
 
-			if terminal.ColorEnabled {
+			// Guarda meta do próprio urlItem (agora que sabemos status/CT)
+			if _, dup := collectedSet[urlItem]; !dup {
+				collectedSet[urlItem] = struct{}{}
+				collectedURLs = append(collectedURLs, urlItem)
+			}
+			metaByURL[urlItem] = graph.NodeMeta{URL: urlItem, Status: result.Status, CT: result.CT}
+
+			// NOVO: -v funciona com ou sem -color
+			if verbose || terminal.ColorEnabled {
 				printVerbose(urlItem, result)
 			}
 
@@ -287,7 +364,12 @@ func main() {
 				}
 				nlink := link
 				key := urlutil.NormalizeKey(nlink, urlIncomplete || urlEntrypoints)
-				collectedURLs = append(collectedURLs, nlink)
+
+				// Dedup em collected
+				if _, dup := collectedSet[nlink]; !dup {
+					collectedSet[nlink] = struct{}{}
+					collectedURLs = append(collectedURLs, nlink)
+				}
 
 				printKey := key
 				if urlJsOnly || urlEntrypoints {
@@ -306,7 +388,7 @@ func main() {
 						}
 					}
 					if printIt {
-						out.WriteLine(nlink)
+						out.WriteRecord(output.Record{URL: nlink, Status: result.Status, CT: result.CT, RTms: result.RT, Source: "crawl"})
 						printed[printKey] = struct{}{}
 					}
 				}
@@ -336,12 +418,17 @@ func main() {
 	bar.Finish()
 	out.Flush()
 
-	// --- Grafos ---
 	baseName := graphBaseName(flag.Args(), outputFile, graphHTML || graphStatic || graphJS)
 
 	if graphHTML {
 		file := baseName + "_graph.html"
-		if err := graph.GenerateGraph(collectedURLs, file, maxNodes, clusterThreshold); err != nil {
+		gopt := graph.Options{
+			MaxNodes:         maxNodes,
+			ClusterThreshold: clusterThreshold,
+			Hubsize:          hubsize,
+			Metas:            metaByURL,
+		}
+		if err := graph.GenerateGraph(collectedURLs, file, gopt); err != nil {
 			fmt.Fprintf(os.Stderr, "%sErro ao gerar grafo HTML: %v%s\n", terminal.Red, err, terminal.Reset)
 			os.Exit(1)
 		}
@@ -350,7 +437,7 @@ func main() {
 	if graphStatic {
 		file := baseName + "_static.png"
 		if err := graph.GenerateStaticGraph(collectedURLs, file, maxNodes); err != nil {
-			fmt.Fprintf(os.Stderr, "%sErro ao gerar grafo estático: %v%s\n", terminal.Red, err, terminal.Reset)
+			fmt.Fprintf(os.Stderr, "%sErro: %v%s\n", terminal.Red, err, terminal.Reset)
 		} else {
 			fmt.Printf("Grafo estático gerado: %s\n", file)
 		}
@@ -358,16 +445,14 @@ func main() {
 	if graphJS {
 		file := baseName + "_map.js"
 		if err := graph.GenerateJSMap(collectedURLs, file, maxNodes); err != nil {
-			fmt.Fprintf(os.Stderr, "%sErro ao gerar mapa JS: %v%s\n", terminal.Red, err, terminal.Reset)
+			fmt.Fprintf(os.Stderr, "%sErro: %v%s\n", terminal.Red, err, terminal.Reset)
 			os.Exit(1)
 		}
 		fmt.Printf("Mapa JS gerado: %s\n", file)
 	}
 
-	// --- Status final ---
 	stopReason := "completed"
 	interrupted := false
-
 	switch {
 	case ctx.Err() == nil && successCount+errorCount >= maxURLs:
 		stopReason = "max-urls"
@@ -377,7 +462,6 @@ func main() {
 		stopReason = "interrupted"
 		interrupted = true
 	}
-
 	if interrupted {
 		fmt.Fprintf(os.Stderr, "\n[!] Crawling interrompido pelo usuário\n")
 	}
@@ -389,14 +473,43 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Success: %d\n", successCount)
 	fmt.Fprintf(os.Stderr, "Failed: %d\n", errorCount)
 	fmt.Fprintf(os.Stderr, "Links Found: %d\n", linkCount)
+	fmt.Fprintf(os.Stderr, "Unique URLs: %d\n", len(collectedURLs))
 	fmt.Fprintf(os.Stderr, "Stop Reason: %s\n", stopReason)
 }
 
 // ---------------------------------------------------------------------------
-// Helpers locais do main
+// Helpers
 // ---------------------------------------------------------------------------
 
-// splitCSV divide "a,b,c" em []string, removendo vazios. "" → nil.
+// multiFlag permite -H múltiplas vezes.
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ", ") }
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
+	return nil
+}
+
+// parseHeaders converte ["Authorization: Bearer x"] em map.
+func parseHeaders(hs []string) map[string]string {
+	if len(hs) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(hs))
+	for _, h := range hs {
+		i := strings.Index(h, ":")
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(h[:i])
+		v := strings.TrimSpace(h[i+1:])
+		if k != "" {
+			m[k] = v
+		}
+	}
+	return m
+}
+
 func splitCSV(s string) []string {
 	if strings.TrimSpace(s) == "" {
 		return nil
@@ -415,28 +528,28 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// printVerbose imprime uma linha formatada por URL crawleada.
+// verboseFlag é global e mutável (a flag aponta pro endereço).
+var verbose bool
+
 func printVerbose(urlItem string, r crawler.Result) {
 	ts := terminal.Now()
 	statusStr, statusColor := terminal.StatusColor(r.Status)
 	if r.Err != nil {
-		fmt.Fprintf(os.Stderr, "[%s][%sERROR%s] %s%s%s | %v\n",
-			ts, terminal.Bold+terminal.Red, terminal.Reset,
-			terminal.Bold, urlItem, terminal.Reset, r.Err)
+		fmt.Fprintf(os.Stderr, "[%s][ERROR] %s | %v\n", ts, urlItem, r.Err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[%s][%s%s%s%s] %s%s%s%s | %dms | %s\n",
-		ts,
-		terminal.Bold, statusColor, statusStr, terminal.Reset,
-		terminal.Bold, statusColor, urlItem, terminal.Reset,
-		r.RT, r.CT)
+	if terminal.ColorEnabled {
+		fmt.Fprintf(os.Stderr, "[%s][%s%s%s%s] %s%s%s%s | %dms | %s\n",
+			ts, terminal.Bold, statusColor, statusStr, terminal.Reset,
+			terminal.Bold, statusColor, urlItem, terminal.Reset,
+			r.RT, r.CT)
+	} else {
+		fmt.Fprintf(os.Stderr, "[%s][%s] %s | %dms | %s\n", ts, statusStr, urlItem, r.RT, r.CT)
+	}
 }
 
-// graphBaseName decide o prefixo dos arquivos de grafo.
-//
-// Prioridade: argumento posicional > -o (sem extensão) > "grau_graph".
-func graphBaseName(args []string, outputFile string, graphEnabled bool) string {
-	if graphEnabled && len(args) > 0 {
+func graphBaseName(args []string, outputFile string, enabled bool) string {
+	if enabled && len(args) > 0 {
 		name := args[0]
 		if ext := filepath.Ext(name); ext != "" {
 			name = strings.TrimSuffix(name, ext)
@@ -447,4 +560,15 @@ func graphBaseName(args []string, outputFile string, graphEnabled bool) string {
 		return strings.TrimSuffix(outputFile, filepath.Ext(outputFile))
 	}
 	return "grau_graph"
+}
+
+// confirmYolo pede confirmação interativa antes de rodar em modo agressivo.
+//
+// Aceita "y", "yes" ou "s" (case-insensitive). Qualquer outra coisa cancela.
+func confirmYolo() bool {
+	fmt.Fprint(os.Stderr, "\n  Continuar? [y/N] ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(strings.ToLower(line))
+	return line == "y" || line == "yes" || line == "s"
 }
