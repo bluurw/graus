@@ -45,6 +45,7 @@ var (
 		`(?i)\b(?:url|uri|src|href|endpoint|api|baseURL|base_url|baseUri|base_uri|` +
 			`path|pathname|action|target|location|redirect|next|returnTo|return_url|` +
 			`callback|webhook|host|origin|dest|destination|resource|asset|link|` +
+			`apiUrl|api_url|gatewayApiUrl|gateway_api_url|serviceUrl|service_url|cdnUrl|cdn_url|cdnHost|cdn_host|` +
 			`proxy|gateway|uploadURL|upload_url|downloadURL|download_url)` +
 			`\b\s*[:=]\s*` +
 			`(?:"([^"]{1,500})"|'([^']{1,500})'|` + "`([^`]{1,500})`" + `)`,

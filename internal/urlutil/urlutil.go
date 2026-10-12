@@ -95,6 +95,12 @@ func Normalize(raw string, incomplete bool) string {
 		return ""
 	}
 
+	// Protocol-relative URLs: //host/path → https://host/path
+	if strings.HasPrefix(trimmed, "//") {
+		trimmed = "https:" + trimmed
+		lower = strings.ToLower(trimmed)
+	}
+
 	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
 		trimmed = "https://" + trimmed
 	}

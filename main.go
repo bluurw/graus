@@ -32,18 +32,18 @@ const (
 
 func main() {
 	var (
-		target, list, outputFile                             string
-		urlExtensionsExclude, urlQueryStrings, urlExtensions string
-		urlFilter, proxyURL                                  string
-		headerFlags                                          multiFlag
-		urlEntrypoints, urlJsOnly, urlRepeat, urlIncomplete  bool
-		urlAll, noTimeout, graphHTML, graphStatic, graphJS   bool
-		urlRetry, domainDepth, urlMinBytes, urlMaxBytes      int
-		maxURLs, globalTimeout, workers, maxNodes            int
-		clusterThreshold, hubsize                            int
-		jsLoose, quiet, jsonOut, robots, showVersion, yolo   bool
-		rateLimit                                            float64
-		rateBurst                                            int
+		target, list, outputFile                                      string
+		urlExtensionsExclude, urlQueryStrings, urlExtensions          string
+		urlFilter, proxyURL                                           string
+		headerFlags                                                   multiFlag
+		urlEntrypoints, urlJsOnly, urlRepeat, urlIncomplete           bool
+		urlAll, noTimeout, graphHTML, graphStatic, graphJS            bool
+		urlRetry, domainDepth, urlMinBytes, urlMaxBytes               int
+		maxURLs, globalTimeout, workers, maxNodes                     int
+		clusterThreshold, hubsize                                     int
+		jsLoose, quiet, jsonOut, robots, showVersion, yolo, assumeYes bool
+		rateLimit                                                     float64
+		rateBurst                                                     int
 	)
 
 	flag.StringVar(&target, "t", "", "Target URL")
@@ -86,6 +86,7 @@ func main() {
 	flag.Var(&headerFlags, "H", "Custom header (e.g. -H 'Authorization: Bearer x')")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.BoolVar(&yolo, "yolo", false, "Aggressive mode: enables -url-all -js-loose -no-timeout -robots -rate-limit 0")
+	flag.BoolVar(&assumeYes, "yes", false, "Skip interactive confirmation (use with -yolo in scripts)")
 
 	flag.Parse()
 
@@ -94,7 +95,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s[!] Modo YOLO ativado:%s\n", terminal.Yellow, terminal.Reset)
 		fmt.Fprintf(os.Stderr, "    - Sem rate limit, sem timeout, workers no máximo\n")
 		fmt.Fprintf(os.Stderr, "    - Só use em alvo que você tem autorização escrita\n")
-		if !confirmYolo() {
+		if !assumeYes && !confirmYolo() {
 			fmt.Fprintln(os.Stderr, "Cancelado.")
 			os.Exit(1)
 		}
