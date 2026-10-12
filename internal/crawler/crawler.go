@@ -4,6 +4,7 @@ package crawler
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -17,7 +18,6 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 
-	"grau/internal/ratelimit"
 	"grau/internal/urlutil"
 )
 
@@ -50,20 +50,17 @@ var urlAttrs = map[string][]string{
 // Client global — construído por BuildClient.
 var Client *http.Client
 
-// BuildClient cria o HTTP client com base nas Options do crawler.
-// Deve ser chamado uma vez em main().
+// BuildClient cria o HTTP client.
 func BuildClient(proxyURL string) error {
 	tr := &http.Transport{
 		MaxIdleConns:          500,
 		MaxIdleConnsPerHost:   150,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second, // NOVO
+		ResponseHeaderTimeout: 15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// Compressão LIGADA (padrão do Go) — economiza banda
-		ForceAttemptHTTP2: true,
+		ForceAttemptHTTP2:     true,
 	}
-
 	if proxyURL != "" {
 		pu, err := url.Parse(proxyURL)
 		if err != nil {
@@ -73,7 +70,6 @@ func BuildClient(proxyURL string) error {
 	} else {
 		tr.Proxy = http.ProxyFromEnvironment
 	}
-
 	Client = &http.Client{
 		Transport: tr,
 		Timeout:   30 * time.Second,
@@ -93,18 +89,11 @@ type Result struct {
 	Err    error
 }
 
-// Options controla o comportamento do crawl.
-type Options struct {
-	Retries     int
-	MinBytes    int
-	MaxBytes    int
-	Incomplete  bool
-	EntryPoints bool
-	JSLoose     bool
-
-	// NOVOS
-	Limiter *ratelimit.HostLimiter
-	Headers map[string]string
+// DeepFinding é o que os extratores profundos produzem.
+type DeepFinding struct {
+	Kind string
+	URL  string
+	Data string
 }
 
 // Fetch baixa uma URL e extrai links.
@@ -127,12 +116,13 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 		if err := ctx.Err(); err != nil {
 			return Result{Err: err}
 		}
-
-		// Rate limit por host
 		if opt.Limiter != nil && host != "" {
 			if err := opt.Limiter.Wait(ctx, host); err != nil {
 				return Result{Err: err}
 			}
+		}
+		if opt.BP != nil {
+			opt.BP.Wait(ctx, host)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fixedURL, nil)
@@ -172,14 +162,18 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 			return Result{Status: resp.StatusCode, RT: time.Since(start).Milliseconds(), Err: lastErr}
 		}
 
-		// Retry-After respeitado (429 / 503)
 		if resp.StatusCode == 429 || resp.StatusCode == 503 {
+			if opt.BP != nil {
+				opt.BP.RecordFailure(host)
+			}
 			wait := parseRetryAfter(resp.Header.Get("Retry-After"))
 			if wait > 0 && wait <= 60*time.Second {
 				if !sleepCtx(ctx, wait) {
 					return Result{Err: ctx.Err()}
 				}
 			}
+		} else if opt.BP != nil {
+			opt.BP.RecordSuccess(host)
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -239,7 +233,115 @@ func Fetch(ctx context.Context, urlStr string, opt Options) Result {
 	return Result{Err: fmt.Errorf("failed after retries: %w", lastErr)}
 }
 
-// backoff exponencial com jitter: 200ms * 2^attempt + jitter(0-100ms).
+// FetchDeep faz o fetch normal e, se Deep/SourceMap/Headless estiverem ligados,
+// devolve também os achados profundos.
+func FetchDeep(ctx context.Context, urlStr string, opt Options) (Result, []DeepFinding) {
+	res := Fetch(ctx, urlStr, opt)
+	if !opt.Deep && !opt.SourceMap && !opt.Headless {
+		return res, nil
+	}
+
+	fixedURL := urlStr
+	if !strings.HasPrefix(strings.ToLower(fixedURL), "http://") &&
+		!strings.HasPrefix(strings.ToLower(fixedURL), "https://") {
+		fixedURL = "https://" + fixedURL
+	}
+	baseURL := mustParse(fixedURL)
+	if baseURL == nil {
+		return res, nil
+	}
+
+	var findings []DeepFinding
+
+	// Headless (Feature 2)
+	if opt.Headless {
+		hr := FetchHeadless(ctx, fixedURL, opt)
+		if hr.Err == nil {
+			for _, x := range hr.XHR {
+				if x.Method == "GET" && x.URL != "" {
+					res.Links = append(res.Links, x.URL)
+				}
+				b, _ := json.Marshal(x)
+				findings = append(findings, DeepFinding{
+					Kind: "xhr",
+					URL:  x.URL,
+					Data: string(b),
+				})
+			}
+			for _, l := range hr.DOMLinks {
+				res.Links = append(res.Links, l)
+			}
+		}
+	}
+
+	if res.Err != nil {
+		return res, findings
+	}
+
+	body, ct, ok := fetchBody(ctx, fixedURL, opt)
+	if !ok {
+		return res, findings
+	}
+	lowerCT := strings.ToLower(ct)
+
+	// Deep (Feature 4) — forms em HTML
+	if opt.Deep && (strings.Contains(lowerCT, "text/html") || lowerCT == "") {
+		if forms := ExtractFormsFromHTML(body, ct, baseURL); len(forms) > 0 {
+			for _, f := range forms {
+				findings = append(findings, DeepFinding{
+					Kind: "form",
+					URL:  f.Action,
+					Data: f.JSON(),
+				})
+			}
+		}
+	}
+
+	// Deep (Feature 4) + SourceMap (Feature 3) — em JS
+	if strings.Contains(lowerCT, "javascript") || strings.Contains(lowerCT, "ecmascript") {
+		if opt.Deep {
+			for _, k := range ExtractJSONBodyKeys(string(body)) {
+				findings = append(findings, DeepFinding{Kind: "json_key", URL: fixedURL, Data: k})
+			}
+			for _, h := range ExtractCustomHeaders(string(body)) {
+				findings = append(findings, DeepFinding{Kind: "header", URL: fixedURL, Data: h})
+			}
+		}
+		if opt.SourceMap {
+			for _, m := range FindSourceMaps(string(body), fixedURL) {
+				findings = append(findings, DeepFinding{Kind: "sourcemap", URL: m, Data: m})
+			}
+		}
+	}
+
+	return res, findings
+}
+
+func fetchBody(ctx context.Context, urlStr string, opt Options) ([]byte, string, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, "", false
+	}
+	req.Header.Set("User-Agent", userAgents[0])
+	req.Header.Set("Accept", "*/*")
+	for k, v := range opt.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := Client.Do(req)
+	if err != nil {
+		return nil, "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", false
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, MaxBodySize))
+	if err != nil {
+		return nil, "", false
+	}
+	return b, resp.Header.Get("Content-Type"), true
+}
+
 func backoff(attempt int) time.Duration {
 	base := 200 * time.Millisecond
 	mult := time.Duration(1) << uint(attempt)
@@ -250,7 +352,6 @@ func backoff(attempt int) time.Duration {
 	return base*mult + jitter
 }
 
-// parseRetryAfter interpreta Retry-After em segundos ou data HTTP.
 func parseRetryAfter(v string) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -284,7 +385,6 @@ func mustParse(raw string) *url.URL {
 	return u
 }
 
-// extractLinks — HTML + regex bruta.
 func extractLinks(body []byte, contentType, fixedURL string, incomplete, jsLoose bool) []string {
 	linkSet := make(map[string]struct{}, 200)
 	baseURL, _ := url.Parse(fixedURL)

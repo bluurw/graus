@@ -11,10 +11,6 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-// ---------------------------------------------------------------------------
-// Regex (compiladas uma vez; regexp.Regexp é thread-safe para Match*)
-// ---------------------------------------------------------------------------
-
 var (
 	urlRegex = regexp.MustCompile(
 		`https?://[a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})+(?:/[\w\-./?%&=:#~'$,]*[\w/])?`,
@@ -27,19 +23,13 @@ var (
 	entrypointRegex = regexp.MustCompile(`\?[^=]+=[^&\s"']+`)
 )
 
-// URLRegex expõe a regex para uso externo (crawler).
 func URLRegex() *regexp.Regexp { return urlRegex }
-
-// ---------------------------------------------------------------------------
-// Cache de domínio raiz e querystrings
-// ---------------------------------------------------------------------------
 
 var (
 	rootDomainCache = sync.Map{}
 	qsCache         = sync.Map{}
 )
 
-// RootDomain retorna o domínio registrável (ex.: sub.example.co.uk → example.co.uk).
 func RootDomain(host string) string {
 	host = strings.ToLower(host)
 	if host == "" {
@@ -56,7 +46,6 @@ func RootDomain(host string) string {
 	return root
 }
 
-// DomainFromURL retorna o hostname (sem porta) em lowercase.
 func DomainFromURL(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -64,14 +53,7 @@ func DomainFromURL(u *url.URL) string {
 	return strings.ToLower(u.Hostname())
 }
 
-// ---------------------------------------------------------------------------
-// Normalização
-// ---------------------------------------------------------------------------
-
 // Normalize limpa e canonicaliza uma URL.
-//
-// Se incomplete=true e a entrada não for absoluta, retorna apenas o path
-// (começando com "/").
 func Normalize(raw string, incomplete bool) string {
 	raw = html.UnescapeString(raw)
 	trimmed := strings.Trim(raw, " .,;?!\"'<> \t\n\r()[]")
@@ -81,7 +63,6 @@ func Normalize(raw string, incomplete bool) string {
 
 	lower := strings.ToLower(trimmed)
 
-	// URL incompleta (path relativo/absoluto)
 	if incomplete && !strings.Contains(trimmed, "://") &&
 		!strings.HasPrefix(lower, "javascript:") &&
 		!strings.HasPrefix(lower, "data:") {
@@ -95,7 +76,6 @@ func Normalize(raw string, incomplete bool) string {
 		return ""
 	}
 
-	// Protocol-relative URLs: //host/path → https://host/path
 	if strings.HasPrefix(trimmed, "//") {
 		trimmed = "https:" + trimmed
 		lower = strings.ToLower(trimmed)
@@ -110,7 +90,6 @@ func Normalize(raw string, incomplete bool) string {
 		return ""
 	}
 
-	// Cache de domínio raiz
 	host := strings.ToLower(parsed.Hostname())
 	if _, ok := rootDomainCache.Load(host); !ok {
 		_ = RootDomain(host)
@@ -122,7 +101,67 @@ func Normalize(raw string, incomplete bool) string {
 	return parsed.String()
 }
 
-// NormalizeKey produz uma chave para deduplicação.
+// LooksTruncated rejeita paths que parecem pedaço de URL.
+//
+// Casos rejeitados:
+//   - path muito curto (<=4 chars) sem extensão nem query: "/a", "/co"
+//   - termina em "-" ou "_" (concatenação partida)
+//   - contém %CC%81 sem extensão (encoding duplo do acento agudo)
+//   - termina em "/" e nada depois (só diretório)
+func LooksTruncated(raw string) bool {
+	if raw == "" {
+		return false
+	}
+
+	// Pega só a parte path (sem scheme/host/query)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	path := u.Path
+	if path == "" {
+		return false
+	}
+
+	// Último segmento depois da barra
+	lastSlash := strings.LastIndex(path, "/")
+	lastSegment := path
+	if lastSlash >= 0 {
+		lastSegment = path[lastSlash+1:]
+	}
+
+	// 1. Segmento vazio
+	if lastSegment == "" {
+		return false // é diretório raiz ou /foo/, aceitável
+	}
+
+	// 2. Muito curto e sem extensão/query
+	if len(lastSegment) <= 4 &&
+		!strings.Contains(lastSegment, ".") &&
+		u.RawQuery == "" {
+		return true
+	}
+
+	// 3. Termina em hífen/underscore
+	lowerSeg := strings.ToLower(lastSegment)
+	if strings.HasSuffix(lowerSeg, "-") || strings.HasSuffix(lowerSeg, "_") {
+		return true
+	}
+
+	// 4. %CC%81 (acento agudo) partido sem extensão
+	lowerPath := strings.ToLower(path)
+	if strings.Contains(lowerPath, "%cc%81") && !strings.Contains(lowerSeg, ".") {
+		return true
+	}
+
+	// 5. Termina com % e 2 hex chars isolado (encoding partido)
+	if len(lowerSeg) > 3 && strings.HasSuffix(lowerSeg, "%") {
+		return true
+	}
+
+	return false
+}
+
 func NormalizeKey(u string, incomplete bool) string {
 	if incomplete {
 		return strings.Trim(u, "/")
@@ -136,13 +175,6 @@ func NormalizeKey(u string, incomplete bool) string {
 	return p.String()
 }
 
-// ---------------------------------------------------------------------------
-// Escopo
-// ---------------------------------------------------------------------------
-
-// InScope verifica se a URL pertence ao conjunto de domínios permitidos.
-//
-// Se incomplete=true, tudo é considerado em escopo (paths relativos).
 func InScope(link string, allowed map[string]struct{}, incomplete bool) bool {
 	if incomplete {
 		return true
@@ -156,12 +188,7 @@ func InScope(link string, allowed map[string]struct{}, incomplete bool) bool {
 	return ok
 }
 
-// ---------------------------------------------------------------------------
-// Filtros
-// ---------------------------------------------------------------------------
-
 var (
-	// BlockedExtensions são extensões ignoradas por padrão.
 	BlockedExtensions = map[string]struct{}{
 		"jpg": {}, "jpeg": {}, "png": {}, "gif": {}, "bmp": {}, "svg": {}, "ico": {},
 		"webp": {}, "avif": {}, "apng": {},
@@ -173,10 +200,8 @@ var (
 	}
 )
 
-// IsBlockedExtension verifica se a URL aponta para arquivo bloqueado.
 func IsBlockedExtension(link string) bool {
 	lower := strings.ToLower(link)
-	// Remove query/fragment
 	if i := strings.IndexAny(lower, "?#"); i != -1 {
 		lower = lower[:i]
 	}
@@ -192,7 +217,6 @@ func IsBlockedExtension(link string) bool {
 	return blocked
 }
 
-// HasValidEntrypoint verifica se a URL contém ?k=v.
 func HasValidEntrypoint(link string) bool {
 	u, err := url.Parse(link)
 	if err != nil || u.RawQuery == "" {
@@ -206,7 +230,6 @@ func HasValidEntrypoint(link string) bool {
 	return ok
 }
 
-// Filters agrupa os parâmetros de filtragem.
 type Filters struct {
 	EntryPoints bool
 	JSOnly      bool
@@ -218,7 +241,6 @@ type Filters struct {
 	FilterStr   string
 }
 
-// Pass retorna true se o link sobrevive a todos os filtros ativos.
 func Pass(link string, f Filters) bool {
 	if f.All {
 		return true
@@ -229,7 +251,6 @@ func Pass(link string, f Filters) bool {
 		lowerLink = strings.ToLower(link)
 	}
 
-	// Extrai extensão sem query/fragmento
 	cleanExt := lowerLink
 	if i := strings.IndexAny(cleanExt, "?#"); i != -1 {
 		cleanExt = cleanExt[:i]

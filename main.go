@@ -20,30 +20,39 @@ import (
 	"grau/internal/crawler"
 	"grau/internal/graph"
 	"grau/internal/output"
+	"grau/internal/passive"
+	"grau/internal/queue"
 	"grau/internal/ratelimit"
 	"grau/internal/terminal"
 	"grau/internal/urlutil"
 )
 
 const (
-	Version    = "v11"
+	Version    = "v17"
 	MaxWorkers = 40
 )
 
 func main() {
 	var (
-		target, list, outputFile                                      string
-		urlExtensionsExclude, urlQueryStrings, urlExtensions          string
-		urlFilter, proxyURL                                           string
-		headerFlags                                                   multiFlag
-		urlEntrypoints, urlJsOnly, urlRepeat, urlIncomplete           bool
-		urlAll, noTimeout, graphHTML, graphStatic, graphJS            bool
-		urlRetry, domainDepth, urlMinBytes, urlMaxBytes               int
-		maxURLs, globalTimeout, workers, maxNodes                     int
-		clusterThreshold, hubsize                                     int
-		jsLoose, quiet, jsonOut, robots, showVersion, yolo, assumeYes bool
-		rateLimit                                                     float64
-		rateBurst                                                     int
+		target, list, outputFile                             string
+		urlExtensionsExclude, urlQueryStrings, urlExtensions string
+		urlFilter, proxyURL, outDir                          string
+		headerFlags                                          multiFlag
+		urlEntrypoints, urlJsOnly, urlRepeat, urlIncomplete  bool
+		urlAll, noTimeout, graphHTML, graphStatic, graphJS   bool
+		urlRetry, domainDepth, urlMinBytes, urlMaxBytes      int
+		maxURLs, globalTimeout, workers, maxNodes            int
+		clusterThreshold, hubsize                            int
+		jsLoose, quiet, jsonOut, robots, showVersion         bool
+		yolo, assumeYes, details                             bool
+		headless, sourceMap, deep                            bool
+		includeSubdomains, prioritize, backpressure          bool
+		excludeHosts                                         multiFlag
+		scopeRegex                                           string
+		rateLimit                                            float64
+		rateBurst                                            int
+		passiveAll, passiveWayback, passiveCC                bool
+		passiveOTX, passiveURLScan                           bool
 	)
 
 	flag.StringVar(&target, "t", "", "Target URL")
@@ -58,61 +67,99 @@ func main() {
 	flag.IntVar(&urlMinBytes, "url-minBytes", 0, "Min response size")
 	flag.IntVar(&urlMaxBytes, "url-maxBytes", -1, "Max response size")
 	flag.IntVar(&maxURLs, "max-urls", 1_000_000, "Max total URLs to crawl")
-	flag.IntVar(&globalTimeout, "global-timeout", 3600, "Global timeout (seconds, 0 = unlimited)")
-	flag.BoolVar(&urlRepeat, "url-repeat", false, "Allow repeated URLs (default: dedup)")
+	flag.IntVar(&globalTimeout, "global-timeout", 3600, "Global timeout (seconds)")
+	flag.BoolVar(&urlRepeat, "url-repeat", false, "Allow repeated URLs")
 	flag.StringVar(&urlExtensions, "url-extensions", "", "Allowed extensions")
 	flag.StringVar(&urlFilter, "url-filter", "", "String filter in URL")
-	flag.BoolVar(&urlIncomplete, "url-incomplete", false, "Allow incomplete URLs (relative paths)")
-	flag.BoolVar(&urlAll, "url-all", false, "Return ALL URLs (no filter)")
+	flag.BoolVar(&urlIncomplete, "url-incomplete", false, "Allow relative URLs")
+	flag.BoolVar(&urlAll, "url-all", false, "Return ALL URLs")
 	flag.BoolVar(&noTimeout, "no-timeout", false, "Disable global timeout")
 	flag.IntVar(&workers, "workers", MaxWorkers, "Concurrent workers")
 	flag.BoolVar(&terminal.ColorEnabled, "color", false, "Enable color output")
-	flag.BoolVar(&verbose, "v", false, "Verbose mode (status per URL)")
-	flag.BoolVar(&graphHTML, "graph-html", false, "Generate HTML graph visualization")
-	flag.BoolVar(&graphStatic, "graph-static", false, "Generate static PNG graph (requires graphviz)")
-	flag.BoolVar(&graphJS, "graph-js", false, "Generate .js file with URL map")
-	flag.IntVar(&maxNodes, "max-nodes", 10000, "Maximum number of nodes in graph")
-	flag.IntVar(&clusterThreshold, "cluster-threshold", 50, "Min nodes to auto-cluster")
+	flag.BoolVar(&verbose, "v", false, "Verbose mode")
+	flag.BoolVar(&details, "details", false, "Details: one line per URL with source and time")
+	flag.BoolVar(&graphHTML, "graph-html", false, "Generate HTML graph")
+	flag.BoolVar(&graphStatic, "graph-static", false, "Generate static PNG")
+	flag.BoolVar(&graphJS, "graph-js", false, "Generate JS map")
+	flag.IntVar(&maxNodes, "max-nodes", 10000, "Max nodes in graph")
+	flag.IntVar(&clusterThreshold, "cluster-threshold", 50, "Auto-cluster threshold")
 	flag.IntVar(&hubsize, "hubsize", 5, "clusterByHubsize threshold")
-	flag.BoolVar(&jsLoose, "js-loose", false, "Aggressive JS string extraction")
+	flag.BoolVar(&jsLoose, "js-loose", false, "Aggressive JS extraction")
+	flag.BoolVar(&quiet, "q", false, "Quiet stdout")
+	flag.BoolVar(&jsonOut, "json", false, "JSON lines output")
+	flag.BoolVar(&robots, "robots", true, "Fetch robots.txt/sitemap.xml")
+	flag.StringVar(&proxyURL, "proxy", "", "HTTP/SOCKS proxy")
+	flag.Float64Var(&rateLimit, "rate-limit", 5, "Requests/sec per host")
+	flag.IntVar(&rateBurst, "rate-burst", 10, "Burst")
+	flag.Var(&headerFlags, "H", "Custom header")
+	flag.BoolVar(&showVersion, "version", false, "Print version")
+	flag.BoolVar(&yolo, "yolo", false, "Aggressive mode")
+	flag.BoolVar(&assumeYes, "yes", false, "Skip interactive confirmation")
 
-	// NOVAS
-	flag.BoolVar(&quiet, "q", false, "Quiet: suppress stdout URLs (only file output)")
-	flag.BoolVar(&jsonOut, "json", false, "Output one JSON object per line")
-	flag.BoolVar(&robots, "robots", true, "Fetch robots.txt and sitemap.xml")
-	flag.StringVar(&proxyURL, "proxy", "", "HTTP/SOCKS proxy URL")
-	flag.Float64Var(&rateLimit, "rate-limit", 5, "Max requests per second per host (0 = unlimited)")
-	flag.IntVar(&rateBurst, "rate-burst", 10, "Burst for rate limiter")
-	flag.Var(&headerFlags, "H", "Custom header (e.g. -H 'Authorization: Bearer x')")
-	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
-	flag.BoolVar(&yolo, "yolo", false, "Aggressive mode: enables -url-all -js-loose -no-timeout -robots -rate-limit 0")
-	flag.BoolVar(&assumeYes, "yes", false, "Skip interactive confirmation (use with -yolo in scripts)")
+	flag.BoolVar(&headless, "headless", false, "Use headless Chrome")
+	flag.BoolVar(&sourceMap, "sourcemap", false, "Fetch .map files")
+	flag.BoolVar(&deep, "deep", false, "Extract forms, JSON keys, headers")
+
+	flag.StringVar(&outDir, "out-dir", "", "Directory for segmented output")
+	flag.String("out-urls", "", "(reserved)")
+	flag.String("out-params", "", "(reserved)")
+	flag.String("out-js", "", "(reserved)")
+	flag.String("out-xhr", "", "(reserved)")
+	flag.String("out-forms", "", "(reserved)")
+	flag.String("out-keys", "", "(reserved)")
+	flag.String("out-headers", "", "(reserved)")
+	flag.String("out-sourcemaps", "", "(reserved)")
+
+	flag.BoolVar(&includeSubdomains, "include-subdomains", false, "Include any subdomain")
+	flag.Var(&excludeHosts, "exclude-host", "Host to exclude")
+	flag.StringVar(&scopeRegex, "scope-regex", "", "Only accept URLs matching this regex")
+
+	flag.BoolVar(&prioritize, "prioritize", false, "Prioritize URLs with params/JS/api")
+	flag.BoolVar(&backpressure, "backpressure", false, "Slow down 429/503 hosts")
+
+	flag.BoolVar(&passiveAll, "passive-all", false, "Enable all passive sources")
+	flag.BoolVar(&passiveWayback, "passive-wayback", false, "Wayback Machine")
+	flag.BoolVar(&passiveCC, "passive-cc", false, "Common Crawl")
+	flag.BoolVar(&passiveOTX, "passive-otx", false, "AlienVault OTX")
+	flag.BoolVar(&passiveURLScan, "passive-urlscan", false, "URLScan.io")
 
 	flag.Parse()
 
+	passiveExplicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) {
+		if strings.HasPrefix(f.Name, "passive-") {
+			passiveExplicit[f.Name] = true
+		}
+	})
+	anyPassiveExplicit := len(passiveExplicit) > 0
+
 	if yolo {
-		// Aviso interativo: exige confirmação explícita
 		fmt.Fprintf(os.Stderr, "%s[!] Modo YOLO ativado:%s\n", terminal.Yellow, terminal.Reset)
-		fmt.Fprintf(os.Stderr, "    - Sem rate limit, sem timeout, workers no máximo\n")
-		fmt.Fprintf(os.Stderr, "    - Só use em alvo que você tem autorização escrita\n")
 		if !assumeYes && !confirmYolo() {
 			fmt.Fprintln(os.Stderr, "Cancelado.")
 			os.Exit(1)
 		}
-
 		urlAll = true
 		jsLoose = true
 		noTimeout = true
 		robots = true
 		rateLimit = 0
 		workers = MaxWorkers
+		deep = true
+		sourceMap = true
+		includeSubdomains = true
+		prioritize = true
+		backpressure = true
+
+		if !anyPassiveExplicit {
+			passiveAll = true
+		}
 	}
 
 	if showVersion {
 		fmt.Println("grau", Version)
 		os.Exit(0)
 	}
-
 	if noTimeout {
 		globalTimeout = 0
 	}
@@ -120,33 +167,27 @@ func main() {
 	if target == "" && list == "" {
 		terminal.Art()
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\n\n%s Examples:%s\n", terminal.Bold, terminal.Reset)
-		fmt.Println(" Normal Crawler: go run . -t https://example.com")
-		fmt.Println(" Entrypoints:    go run . -t https://example.com -url-entrypoints")
-		fmt.Println(" JsOnly:         go run . -t https://example.com -url-jsOnly")
-		fmt.Println(" Incomplete:     go run . -t https://example.com -url-incomplete")
-		fmt.Println(" JS Loose:       go run . -t https://example.com -js-loose")
-		fmt.Println(" JSON output:    go run . -t https://example.com -json")
-		fmt.Println(" Graph HTML:     go run . -l urls.txt -graph-html nome")
 		os.Exit(1)
 	}
 
-	// Construir client (proxy)
 	if err := crawler.BuildClient(proxyURL); err != nil {
 		fmt.Fprintf(os.Stderr, "%sErro: %v%s\n", terminal.Red, err, terminal.Reset)
 		os.Exit(1)
 	}
 
-	// Headers customizados
+	if headless && !crawler.ChromeAvailable() {
+		fmt.Fprintf(os.Stderr, "%s[!] --headless pedido, mas Chrome/Chromium não encontrado. Ignorando.%s\n", terminal.Yellow, terminal.Reset)
+		headless = false
+	}
+
 	customHeaders := parseHeaders(headerFlags)
 
-	// Coleta start URLs
 	startURLs := []string{}
 	allowedRoots := make(map[string]struct{}, 100)
 	if list != "" {
 		f, err := os.Open(list)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%sErro ao abrir arquivo: %v%s\n", terminal.Red, err, terminal.Reset)
+			fmt.Fprintf(os.Stderr, "%sErro: %v%s\n", terminal.Red, err, terminal.Reset)
 			os.Exit(1)
 		}
 		defer f.Close()
@@ -176,6 +217,33 @@ func main() {
 		}
 	}
 
+	// Cabeçalho de sessão
+	for root := range allowedRoots {
+		fmt.Fprintf(os.Stderr, "%s[aggressive]%s graus → %s (session start)\n", terminal.Yellow, terminal.Reset, root)
+	}
+
+	// Lista de roots fixa — nunca muda depois do boot.
+	// Só aceitamos URLs cujo root domain esteja nesta lista.
+	scopeRoots := make([]string, 0, len(allowedRoots))
+	for root := range allowedRoots {
+		scopeRoots = append(scopeRoots, root)
+	}
+
+	// hostInScope verifica se o host pertence a um dos roots conhecidos
+	// (host é igual ao root ou subdomínio dele). NUNCA adiciona.
+	hostInScope := func(host string) bool {
+		host = strings.ToLower(host)
+		if host == "" {
+			return false
+		}
+		for _, root := range scopeRoots {
+			if host == root || strings.HasSuffix(host, "."+root) {
+				return true
+			}
+		}
+		return false
+	}
+
 	filters := urlutil.Filters{
 		EntryPoints: urlEntrypoints,
 		JSOnly:      urlJsOnly,
@@ -192,7 +260,6 @@ func main() {
 	printed := make(map[string]struct{}, 500_000)
 	domainDepths := make(map[string]int, 1000)
 
-	// NOVO: dedup de collectedURLs
 	collectedSet := make(map[string]struct{}, 500_000)
 	collectedURLs := make([]string, 0, 500_000)
 	metaByURL := make(map[string]graph.NodeMeta, 500_000)
@@ -205,12 +272,22 @@ func main() {
 
 	out, err := output.New(outputFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sErro ao abrir arquivo: %v%s\n", terminal.Red, err, terminal.Reset)
+		fmt.Fprintf(os.Stderr, "%sErro: %v%s\n", terminal.Red, err, terminal.Reset)
 		os.Exit(1)
 	}
 	out.Quiet = quiet
 	out.JSON = jsonOut
 	defer out.Close()
+
+	var seg *output.SegmentedWriter
+	if outDir != "" {
+		seg, err = output.NewSegmented(outDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%sErro ao criar out-dir: %v%s\n", terminal.Red, err, terminal.Reset)
+			os.Exit(1)
+		}
+		defer seg.Close()
+	}
 
 	var baseCtx context.Context
 	var cancel context.CancelFunc
@@ -240,21 +317,37 @@ func main() {
 	)
 
 	limiter := ratelimit.New(rateLimit, rateBurst)
+	bp := ratelimit.NewBackpressure(backpressure)
+
+	opts := crawler.Options{
+		Retries:           urlRetry,
+		MinBytes:          urlMinBytes,
+		MaxBytes:          urlMaxBytes,
+		Incomplete:        urlIncomplete,
+		EntryPoints:       urlEntrypoints,
+		JSLoose:           jsLoose,
+		Limiter:           limiter,
+		Headers:           customHeaders,
+		Headless:          headless,
+		SourceMap:         sourceMap,
+		Deep:              deep,
+		IncludeSubdomains: includeSubdomains,
+		ExcludeHosts:      excludeHosts,
+		ScopeRegex:        scopeRegex,
+		Prioritize:        prioritize,
+		Backpressure:      backpressure,
+		BP:                bp,
+	}
+	if err := opts.Compile(); err != nil {
+		fmt.Fprintf(os.Stderr, "%sErro no scope-regex: %v%s\n", terminal.Red, err, terminal.Reset)
+		os.Exit(1)
+	}
 
 	tasks := make(chan string, workers*2)
 	results := make(chan crawler.Result, workers)
-	var wg sync.WaitGroup
-	opts := crawler.Options{
-		Retries:     urlRetry,
-		MinBytes:    urlMinBytes,
-		MaxBytes:    urlMaxBytes,
-		Incomplete:  urlIncomplete,
-		EntryPoints: urlEntrypoints,
-		JSLoose:     jsLoose,
-		Limiter:     limiter,
-		Headers:     customHeaders,
-	}
+	deepCh := make(chan crawler.DeepFinding, workers*4)
 
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -263,7 +356,14 @@ func main() {
 				if ctx.Err() != nil {
 					return
 				}
-				res := crawler.Fetch(ctx, u, opts)
+				res, findings := crawler.FetchDeep(ctx, u, opts)
+				for _, f := range findings {
+					select {
+					case deepCh <- f:
+					case <-ctx.Done():
+						return
+					}
+				}
 				select {
 				case results <- res:
 				case <-ctx.Done():
@@ -273,31 +373,98 @@ func main() {
 		}()
 	}
 
+	var deepCounters struct {
+		sync.Mutex
+		xhr, form, key, header, sourcemap int
+	}
+	var deepWG sync.WaitGroup
+	deepWG.Add(1)
+	go func() {
+		defer deepWG.Done()
+		for f := range deepCh {
+			if seg != nil {
+				switch f.Kind {
+				case "xhr":
+					_ = seg.WriteXHR(f.Data)
+				case "form":
+					_ = seg.WriteForm(f.URL, f.Data)
+				case "json_key":
+					_ = seg.WriteKey(f.Data)
+				case "header":
+					_ = seg.WriteHeader(f.Data)
+				case "sourcemap":
+					_ = seg.WriteSourceMap(f.Data)
+				}
+			}
+			deepCounters.Lock()
+			switch f.Kind {
+			case "xhr":
+				deepCounters.xhr++
+			case "form":
+				deepCounters.form++
+			case "json_key":
+				deepCounters.key++
+			case "header":
+				deepCounters.header++
+			case "sourcemap":
+				deepCounters.sourcemap++
+			}
+			deepCounters.Unlock()
+		}
+	}()
+
 	go func() {
 		wg.Wait()
 		close(results)
+		close(deepCh)
 	}()
 
-	var successCount, errorCount, linkCount int
+	var successCount, errorCount, linkCount, passiveCount int
 	var lastURL string
 	startTime := time.Now()
+	lastHost := ""
 
 	go func() {
 		defer close(tasks)
-		queue := make([]string, 0, len(seen))
-		for k := range seen {
-			queue = append(queue, k)
+
+		var pq *queue.PriorityQueue
+		var fifo []string
+		if prioritize {
+			pq = queue.New()
 		}
 
-		// NOVO: robots/sitemap na primeira passada
+		enqueue := func(u string) {
+			if prioritize {
+				pq.Enqueue(u)
+			} else {
+				fifo = append(fifo, u)
+			}
+		}
+		dequeue := func() (string, bool) {
+			if prioritize {
+				return pq.Dequeue()
+			}
+			if len(fifo) == 0 {
+				return "", false
+			}
+			u := fifo[0]
+			fifo = fifo[1:]
+			return u, true
+		}
+
+		for _, u := range startURLs {
+			if n := urlutil.Normalize(u, false); n != "" {
+				enqueue(n)
+			}
+		}
+
 		if robots {
-			for host := range allowedRoots {
-				// best effort: tenta https
-				wk := crawler.WellKnown(ctx, host, urlIncomplete, jsLoose)
+			for root := range allowedRoots {
+				wk := crawler.WellKnown(ctx, root, urlIncomplete, jsLoose)
 				for _, u := range wk {
 					if _, ok := seen[u]; !ok {
 						seen[u] = struct{}{}
-						queue = append(queue, u)
+						enqueue(u)
 						if _, dup := collectedSet[u]; !dup {
 							collectedSet[u] = struct{}{}
 							collectedURLs = append(collectedURLs, u)
@@ -307,9 +474,91 @@ func main() {
 			}
 		}
 
-		for len(queue) > 0 && ctx.Err() == nil {
-			urlItem := queue[0]
-			queue = queue[1:]
+		// --- Fontes passivas ---
+		if passiveAll {
+			passiveWayback = true
+			passiveCC = true
+			passiveOTX = true
+			passiveURLScan = true
+		}
+		passiveSources := passive.All(passive.Options{
+			Wayback: passiveWayback,
+			CC:      passiveCC,
+			OTX:     passiveOTX,
+			URLScan: passiveURLScan,
+			Timeout: 30 * time.Second,
+		})
+		if len(passiveSources) > 0 {
+			for root := range allowedRoots {
+				for _, src := range passiveSources {
+					fmt.Fprintf(os.Stderr, "%s[passive]%s %s → %s\n", terminal.Cyan, terminal.Reset, src.Name(), root)
+					urls, err := src.Fetch(ctx, root)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "%s[passive]%s %s error: %v\n", terminal.Cyan, terminal.Reset, src.Name(), err)
+						continue
+					}
+					added := 0
+					for _, u := range urls {
+						n := urlutil.Normalize(u, false)
+						if n == "" || urlutil.LooksTruncated(n) {
+							continue
+						}
+						// Verifica se o host está no escopo ANTES de qualquer coisa
+						if p, err := url.Parse(n); err == nil {
+							host := urlutil.DomainFromURL(p)
+							if !hostInScope(host) {
+								continue
+							}
+						} else {
+							continue
+						}
+						if _, dup := printed[n]; !dup {
+							out.WriteRecord(output.Record{URL: n, Source: "passive:" + src.Name()})
+							if seg != nil {
+								_ = seg.WriteURL(n)
+								if urlutil.HasValidEntrypoint(n) {
+									_ = seg.WriteParam(n)
+								}
+								if strings.HasSuffix(strings.ToLower(n), ".js") {
+									_ = seg.WriteJS(n)
+								}
+							}
+							if details {
+								fmt.Fprintf(os.Stderr, "%s[passive]%s[%s] %s\n",
+									terminal.Cyan, terminal.Reset, time.Now().Format("15:04:05"), n)
+							}
+							printed[n] = struct{}{}
+						}
+						if _, ok := seen[n]; ok {
+							continue
+						}
+						seen[n] = struct{}{}
+						passiveCount++
+						added++
+						if _, dup := collectedSet[n]; !dup {
+							collectedSet[n] = struct{}{}
+							collectedURLs = append(collectedURLs, n)
+						}
+						enqueue(n)
+					}
+					fmt.Fprintf(os.Stderr, "[passive] %s: %d URLs\n", src.Name(), added)
+				}
+			}
+		}
+
+		// Cabeçalho do crawl ativo (depois das passivas)
+		for root := range allowedRoots {
+			fmt.Fprintf(os.Stderr, "%s[aggressive]%s crawl → %s (starting)\n", terminal.Yellow, terminal.Reset, root)
+		}
+
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			urlItem, ok := dequeue()
+			if !ok {
+				return
+			}
 			lastURL = urlItem
 
 			u, _ := url.Parse(urlItem)
@@ -317,11 +566,31 @@ func main() {
 				continue
 			}
 			domain := urlutil.DomainFromURL(u)
+
+			if domain != "" && domain != lastHost {
+				if lastHost != "" {
+					fmt.Fprintf(os.Stderr, "%s[aggressive]%s host change: %s → %s\n", terminal.Yellow, terminal.Reset, lastHost, domain)
+				}
+				lastHost = domain
+			}
+
+			if opts.HostExcluded(domain) {
+				continue
+			}
+			if opts.ScopeRegex != "" && !opts.ScopeOK(urlItem) {
+				continue
+			}
+
 			if domain != "" && domainDepths[domain] >= domainDepth {
 				continue
 			}
 			if successCount+errorCount >= maxURLs {
 				break
+			}
+
+			if details {
+				fmt.Fprintf(os.Stderr, "%s[aggressive]%s[%s] %s\n",
+					terminal.Yellow, terminal.Reset, time.Now().Format("15:04:05"), urlItem)
 			}
 
 			select {
@@ -347,26 +616,32 @@ func main() {
 			}
 			bar.Add(1)
 
-			// Guarda meta do próprio urlItem (agora que sabemos status/CT)
 			if _, dup := collectedSet[urlItem]; !dup {
 				collectedSet[urlItem] = struct{}{}
 				collectedURLs = append(collectedURLs, urlItem)
 			}
 			metaByURL[urlItem] = graph.NodeMeta{URL: urlItem, Status: result.Status, CT: result.CT}
 
-			// NOVO: -v funciona com ou sem -color
 			if verbose || terminal.ColorEnabled {
 				printVerbose(urlItem, result)
 			}
 
 			for _, link := range result.Links {
-				if !urlutil.InScope(link, allowedRoots, urlIncomplete) {
+				if urlutil.LooksTruncated(link) {
+					continue
+				}
+				// Verifica host ANTES de qualquer escrita
+				if p, err := url.Parse(link); err == nil {
+					host := urlutil.DomainFromURL(p)
+					if !hostInScope(host) {
+						continue
+					}
+				} else {
 					continue
 				}
 				nlink := link
 				key := urlutil.NormalizeKey(nlink, urlIncomplete || urlEntrypoints)
 
-				// Dedup em collected
 				if _, dup := collectedSet[nlink]; !dup {
 					collectedSet[nlink] = struct{}{}
 					collectedURLs = append(collectedURLs, nlink)
@@ -390,6 +665,15 @@ func main() {
 					}
 					if printIt {
 						out.WriteRecord(output.Record{URL: nlink, Status: result.Status, CT: result.CT, RTms: result.RT, Source: "crawl"})
+						if seg != nil {
+							_ = seg.WriteURL(nlink)
+							if urlutil.HasValidEntrypoint(nlink) {
+								_ = seg.WriteParam(nlink)
+							}
+							if strings.HasSuffix(strings.ToLower(nlink), ".js") {
+								_ = seg.WriteJS(nlink)
+							}
+						}
 						printed[printKey] = struct{}{}
 					}
 				}
@@ -406,7 +690,7 @@ func main() {
 							ld := urlutil.DomainFromURL(p)
 							if ld != "" && domainDepths[ld] < domainDepth {
 								seen[nlink] = struct{}{}
-								queue = append(queue, nlink)
+								enqueue(nlink)
 							}
 						}
 					}
@@ -418,6 +702,10 @@ func main() {
 	wg.Wait()
 	bar.Finish()
 	out.Flush()
+	if seg != nil {
+		seg.Flush()
+	}
+	deepWG.Wait()
 
 	baseName := graphBaseName(flag.Args(), outputFile, graphHTML || graphStatic || graphJS)
 
@@ -475,14 +763,28 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Failed: %d\n", errorCount)
 	fmt.Fprintf(os.Stderr, "Links Found: %d\n", linkCount)
 	fmt.Fprintf(os.Stderr, "Unique URLs: %d\n", len(collectedURLs))
+	if passiveCount > 0 {
+		fmt.Fprintf(os.Stderr, "Passive URLs: %d\n", passiveCount)
+	}
 	fmt.Fprintf(os.Stderr, "Stop Reason: %s\n", stopReason)
+
+	if deep || sourceMap || headless {
+		deepCounters.Lock()
+		fmt.Fprintf(os.Stderr, "\n--- Deep findings ---\n")
+		fmt.Fprintf(os.Stderr, "XHR requests: %d\n", deepCounters.xhr)
+		fmt.Fprintf(os.Stderr, "Forms found: %d\n", deepCounters.form)
+		fmt.Fprintf(os.Stderr, "JSON body keys: %d\n", deepCounters.key)
+		fmt.Fprintf(os.Stderr, "Custom headers: %d\n", deepCounters.header)
+		fmt.Fprintf(os.Stderr, "Source maps: %d\n", deepCounters.sourcemap)
+		deepCounters.Unlock()
+	}
+
+	if seg != nil {
+		fmt.Fprintf(os.Stderr, "\n--- Segmented output ---\n")
+		fmt.Fprintf(os.Stderr, "Directory: %s\n", outDir)
+	}
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// multiFlag permite -H múltiplas vezes.
 type multiFlag []string
 
 func (m *multiFlag) String() string { return strings.Join(*m, ", ") }
@@ -491,7 +793,6 @@ func (m *multiFlag) Set(v string) error {
 	return nil
 }
 
-// parseHeaders converte ["Authorization: Bearer x"] em map.
 func parseHeaders(hs []string) map[string]string {
 	if len(hs) == 0 {
 		return nil
@@ -529,7 +830,6 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// verboseFlag é global e mutável (a flag aponta pro endereço).
 var verbose bool
 
 func printVerbose(urlItem string, r crawler.Result) {
@@ -563,9 +863,6 @@ func graphBaseName(args []string, outputFile string, enabled bool) string {
 	return "grau_graph"
 }
 
-// confirmYolo pede confirmação interativa antes de rodar em modo agressivo.
-//
-// Aceita "y", "yes" ou "s" (case-insensitive). Qualquer outra coisa cancela.
 func confirmYolo() bool {
 	fmt.Fprint(os.Stderr, "\n  Continuar? [y/N] ")
 	reader := bufio.NewReader(os.Stdin)
